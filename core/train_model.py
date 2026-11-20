@@ -1,9 +1,16 @@
 import os
 import joblib
+import numpy as np
+
+from sklearn.base import clone
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.preprocessing import StandardScaler
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
+
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -15,83 +22,21 @@ from sklearn.metrics import (
 from core.preprocessing import (
     load_data,
     prepare_data,
-    split_data,
-    scale_data
+    split_data
 )
 
 
 MODEL_DIR = "models"
-
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 
-def evaluate_model(model, X_test, y_test):
-    """
-    Evaluate a trained classification model.
-    """
+# --------------------------------------------------
+# MODEL DEFINITIONS
+# --------------------------------------------------
 
-    predictions = model.predict(X_test)
-
-    if hasattr(model, "predict_proba"):
-        probabilities = model.predict_proba(X_test)[:, 1]
-    else:
-        probabilities = model.decision_function(X_test)
+def get_models():
 
     return {
-        "accuracy": accuracy_score(y_test, predictions),
-        "precision": precision_score(y_test, predictions),
-        "recall": recall_score(y_test, predictions),
-        "f1": f1_score(y_test, predictions),
-        "roc_auc": roc_auc_score(y_test, probabilities)
-    }
-
-
-def main():
-
-    print("\n===================================")
-    print("     HEALTHGUARD AI MODEL TRAINING")
-    print("===================================\n")
-
-    # --------------------------------------------------
-    # LOAD DATA
-    # --------------------------------------------------
-
-    df = load_data()
-
-    print(f"Dataset shape: {df.shape}")
-
-    # --------------------------------------------------
-    # PREPARE DATA
-    # --------------------------------------------------
-
-    X, y = prepare_data(df)
-
-    # --------------------------------------------------
-    # TRAIN / TEST SPLIT
-    # --------------------------------------------------
-
-    X_train, X_test, y_train, y_test = split_data(
-        X,
-        y,
-        test_size=0.2,
-        random_state=42
-    )
-
-    # --------------------------------------------------
-    # SCALE DATA
-    # --------------------------------------------------
-
-    X_train_scaled, X_test_scaled, scaler = scale_data(
-        X_train,
-        X_test
-    )
-
-    # --------------------------------------------------
-    # MODELS
-    # --------------------------------------------------
-
-    models = {
-
         "Logistic Regression": LogisticRegression(
             max_iter=2000
         ),
@@ -107,70 +52,175 @@ def main():
         )
     }
 
-    results = {}
 
-    # --------------------------------------------------
-    # TRAIN MODELS
-    # --------------------------------------------------
+# --------------------------------------------------
+# EVALUATION
+# --------------------------------------------------
+
+def evaluate_model(model, X_test, y_test):
+
+    predictions = model.predict(X_test)
+
+    classes = list(model.classes_)
+    positive_index = classes.index(1)
+
+    probabilities = model.predict_proba(X_test)[:, positive_index]
+
+    return {
+        "accuracy": float(accuracy_score(y_test, predictions)),
+        "precision": float(precision_score(
+            y_test, predictions, zero_division=0
+        )),
+        "recall": float(recall_score(
+            y_test, predictions, zero_division=0
+        )),
+        "f1": float(f1_score(
+            y_test, predictions, zero_division=0
+        )),
+        "roc_auc": float(roc_auc_score(y_test, probabilities))
+    }
+
+
+# --------------------------------------------------
+# MAIN TRAINING PIPELINE
+# --------------------------------------------------
+
+def main():
+
+    print("\n===================================")
+    print("     HEALTHGUARD AI MODEL TRAINING")
+    print("===================================\n")
+
+    # LOAD DATA
+    df = load_data()
+    print(f"Dataset shape: {df.shape}")
+
+    X, y = prepare_data(df)
+
+    if set(y.unique()) != {0, 1}:
+        raise ValueError("Expected binary target labels 0 and 1.")
+
+    # INDEPENDENT TRAIN / TEST SPLIT
+    X_train, X_test, y_train, y_test = split_data(
+        X,
+        y,
+        test_size=0.2,
+        random_state=42
+    )
+
+    print(f"\nTraining samples: {len(X_train)}")
+    print(f"Testing samples : {len(X_test)}")
+
+    # 5-FOLD STRATIFIED CROSS VALIDATION
+    cv = StratifiedKFold(
+        n_splits=5,
+        shuffle=True,
+        random_state=42
+    )
+
+    models = get_models()
+
+    results = {}
+    pipelines = {}
+
+    print("\n===================================")
+    print("     CROSS-VALIDATION RESULTS")
+    print("===================================")
+
+    scoring = {
+        "accuracy": "accuracy",
+        "precision": "precision",
+        "recall": "recall",
+        "f1": "f1",
+        "roc_auc": "roc_auc"
+    }
 
     for name, model in models.items():
 
-        print(f"\nTraining: {name}")
+        print(f"\nEvaluating: {name}")
 
-        model.fit(
-            X_train_scaled,
-            y_train
+        pipeline = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", clone(model))
+        ])
+
+        cv_results = cross_validate(
+            pipeline,
+            X_train,
+            y_train,
+            cv=cv,
+            scoring=scoring,
+            n_jobs=-1,
+            error_score="raise"
         )
 
-        metrics = evaluate_model(
-            model,
-            X_test_scaled,
-            y_test
-        )
+        cv_auc_mean = float(np.mean(cv_results["test_roc_auc"]))
+        cv_auc_std = float(np.std(cv_results["test_roc_auc"]))
 
-        results[name] = metrics
+        pipelines[name] = pipeline
 
-        print(f"Accuracy : {metrics['accuracy']:.4f}")
-        print(f"Precision: {metrics['precision']:.4f}")
-        print(f"Recall   : {metrics['recall']:.4f}")
-        print(f"F1 Score : {metrics['f1']:.4f}")
-        print(f"ROC-AUC  : {metrics['roc_auc']:.4f}")
+        results[name] = {
+            "cv_accuracy": float(np.mean(cv_results["test_accuracy"])),
+            "cv_precision": float(np.mean(cv_results["test_precision"])),
+            "cv_recall": float(np.mean(cv_results["test_recall"])),
+            "cv_f1": float(np.mean(cv_results["test_f1"])),
+            "cv_roc_auc": cv_auc_mean,
+            "cv_roc_auc_std": cv_auc_std
+        }
 
-    # --------------------------------------------------
-    # FIND BEST MODEL
-    # --------------------------------------------------
+        print(f"CV Accuracy : {results[name]['cv_accuracy']:.4f}")
+        print(f"CV Precision: {results[name]['cv_precision']:.4f}")
+        print(f"CV Recall   : {results[name]['cv_recall']:.4f}")
+        print(f"CV F1       : {results[name]['cv_f1']:.4f}")
+        print(f"CV ROC-AUC  : {cv_auc_mean:.4f} (+/- {cv_auc_std:.4f})")
 
+    # SELECT MODEL USING CV ONLY
     best_model_name = max(
         results,
-        key=lambda name: results[name]["roc_auc"]
+        key=lambda name: results[name]["cv_roc_auc"]
     )
 
     print("\n===================================")
-    print("BEST MODEL")
+    print("BEST MODEL SELECTED")
     print("===================================")
 
     print(best_model_name)
 
-    print("\nMetrics:")
+    # FIT SCALER ONLY ON TRAINING DATA
+    scaler = StandardScaler()
 
-    for metric, value in results[best_model_name].items():
-        print(f"{metric}: {value:.4f}")
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
 
-    # --------------------------------------------------
-    # RETRAIN BEST MODEL
-    # --------------------------------------------------
-
-    best_model = models[best_model_name]
+    # TRAIN SELECTED MODEL ON FULL TRAINING SET
+    best_model = clone(models[best_model_name])
 
     best_model.fit(
         X_train_scaled,
         y_train
     )
 
-    # --------------------------------------------------
-    # SAVE MODEL
-    # --------------------------------------------------
+    # FINAL INDEPENDENT TEST EVALUATION
+    print("\n===================================")
+    print("INDEPENDENT TEST RESULTS")
+    print("===================================")
 
+    test_metrics = evaluate_model(
+        best_model,
+        X_test_scaled,
+        y_test
+    )
+
+    for metric, value in test_metrics.items():
+
+        print(f"{metric.upper():12}: {value:.4f}")
+
+    results[best_model_name].update({
+        f"test_{metric}": value
+        for metric, value in test_metrics.items()
+    })
+
+    # SAVE ARTIFACTS
     joblib.dump(
         best_model,
         os.path.join(MODEL_DIR, "healthguard_model.pkl")
@@ -192,15 +242,15 @@ def main():
     )
 
     print("\n===================================")
-    print("FILES SAVED")
+    print("FILES SAVED SUCCESSFULLY")
     print("===================================")
 
-    print("✓ models/healthguard_model.pkl")
-    print("✓ models/scaler.pkl")
-    print("✓ models/feature_names.pkl")
-    print("✓ models/model_results.pkl")
+    print("healthguard_model.pkl")
+    print("scaler.pkl")
+    print("feature_names.pkl")
+    print("model_results.pkl")
 
-    print("\n✅ MODEL TRAINING COMPLETED!")
+    print("\nMODEL TRAINING COMPLETED!")
 
 
 if __name__ == "__main__":
